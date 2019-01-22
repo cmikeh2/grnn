@@ -50,8 +50,10 @@ template<typename T>
 class GRUModelDouble : public RNNBase<GRULayerDouble, T> {
 
   private:
+    // Buffer for r intermediates
     T * gpu_r;
-
+    
+    // GRU Kernel parameter buffer
     void * paramsGRU[9];
     
   public:

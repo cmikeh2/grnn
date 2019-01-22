@@ -176,7 +176,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
   // Cooperative group helpers
   thread_block bl = this_thread_block();
   thread_block_tile<GROUP_THREADS> work_group = tiled_partition<GROUP_THREADS>(bl);
-
+  
+  // Load weights to register array for either z or h gate
   for (int i = 0; i < TILE_WIDTH; i++) {
     // Global gate id for fetching weights.
     // bidx * TILE_WIDTH * NUM_GROUPS -> the first gate index processed by the threadblock
@@ -202,6 +203,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     }
   }
   
+  // Load weights to register arrays for h gate (weight columns divided between two workgroups)
   for (int i = 0; i < TILE_WIDTH / 2; i++) {
     int output_element = bidx * NUM_GROUPS * TILE_WIDTH / 2 + r_id * TILE_WIDTH + i;
     int which_half = wg_id % 2;
@@ -218,7 +220,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       }
     }
   }
-
+  
+  // Calculate indexing for time independent partial sums for r and z gates
   if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
     int x = work_group.thread_rank() % TILE_WIDTH;
     int y = work_group.thread_rank() / TILE_WIDTH;
@@ -238,7 +241,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     }
 
   }
-
+  
+  // Calculate indexing for time independent partial sums for h gate
   if (tid < OUTPUT_TILE_WIDTH * TILE_HEIGHT) {
     int x = tid % OUTPUT_TILE_WIDTH;
     int y = tid / OUTPUT_TILE_WIDTH; 
@@ -255,6 +259,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     }
   }
   
+  // Zero the dot product accumulators
   #pragma unroll
   for (int j = 0; j < TILE_HEIGHT; j++) {
     #pragma unroll
@@ -263,6 +268,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     }
   }
   
+  // Initialize hidden state according to memory / zero rest of buffer
   #pragma unroll
   for (int j = 0; j < TILE_HEIGHT; j++) {
     #pragma unroll
@@ -274,9 +280,13 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       }
     }
   }
-
+  
+  // Recurrent loop
   for (int sequence_iteration = 0; sequence_iteration < length; sequence_iteration++) {
     
+    /* r and z gates */
+
+    // Dot product
     #pragma unroll
     for (int k = 0; k < LENGTH; k++) {
       #pragma unroll
@@ -288,7 +298,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
         }
       }
     }
-
+    
+    // Reduction
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -299,7 +310,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
         }
       }
     }
-
+    
+    // Activations and broadcast of r gate
     if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
       int reg_x = work_group.thread_rank() % TILE_WIDTH;
       int reg_y = work_group.thread_rank() / TILE_WIDTH;
@@ -323,13 +335,14 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       }
     }
 
-    // Synchronize between recurrent iterations
+    // Synchronize between r/z and h stages - signal stage 
     if (tid == 0) {
       syncIn[bidy * gridDim.x + bidx] =  2 * sequence_iteration + 1;
     }
 
     __threadfence();
     
+    // Zero dot product accumulators
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -337,7 +350,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
         outputs_reg[i][j] = 0.f;
       }
     }
-
+    
+    // Synchronize between r/z and h stages - spin stage
     if (bidx == 0) {
       if (tid < gridDim.x) {
         while ( syncIn[bidy * gridDim.x + tid] != 2 * sequence_iteration + 1) {
@@ -357,6 +371,9 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       __syncthreads();
     }
     
+    /* h gate */
+
+    // Load r gate intermediate
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -372,7 +389,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     __syncthreads();
     
     int which_half = wg_id % 2;
-
+    
+    // Dot product
     #pragma unroll
     for (int k = 0; k < LENGTH / 2; k++) {
       #pragma unroll
@@ -384,7 +402,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
         }
       }
     }
-
+    
+    // Reduction
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -395,7 +414,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
         }
       }
     }
-
+    
+    // Broadcast to shared memory
     if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
       int x = work_group.thread_rank() % TILE_WIDTH;
       int y = work_group.thread_rank() / TILE_WIDTH;
@@ -404,7 +424,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     }
 
     __syncthreads();
-   
+    
+    // Activation and elementwise operations
     if (tid < OUTPUT_TILE_WIDTH * TILE_HEIGHT) {
       int y = tid / OUTPUT_TILE_WIDTH;
       int smem_x = tid % OUTPUT_TILE_WIDTH;
@@ -416,12 +437,16 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       }
     }
     
+    // Escape if at end of sequence length
     if (sequence_iteration + 1 == length) break;
     
+    // Synchronize between recurrent iterations - signal stage 
     if (tid == 0) {
       syncIn[bidy * gridDim.x + bidx] =  2 * sequence_iteration + 2;
     }
+    __threadfence();
 
+    // Fetch time independent partial sums for the next timestep
     if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
       precompute = *precomputed_offset;
       precomputed_offset += HIDDEN_SIZE * BATCH_SIZE * GRU_GATES;
@@ -431,9 +456,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       precompute_h = *precomputed_offset_h;
       precomputed_offset_h += HIDDEN_SIZE * BATCH_SIZE * GRU_GATES;
     }
-
-    __threadfence();
-
+    
+    // Synchronize between recurrent iterations - spin stage
     if (bidx == 0) {
       if (tid < gridDim.x) {
         while ( syncIn[bidy * gridDim.x + tid] != 2 * sequence_iteration + 2) {
@@ -453,6 +477,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       __syncthreads();
     }
     
+    // Load output from t - 1 to buffer
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -522,25 +547,28 @@ void GRULayerDouble<T>::reset() {
   cudaFree((void *) this->packed_biases_gpu);
 }
 
-
+// Initialize and fill buffers for trained parameters
 template<typename T>
 uint32_t GRULayerDouble<T>::initialize() {
   
   uint32_t input_footprint = input_weight_footprint();
   uint32_t hidden_footprint = hidden_weight_footprint();
   uint32_t bias_footprint = bias_weight_footprint();
-
+  
+  // Allocate weights
   cudaHostAlloc((void **) &(this->packed_input_weights), input_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_hidden_weights), hidden_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_biases), bias_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_input_weights_gpu), input_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_hidden_weights_gpu), hidden_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_biases_gpu), bias_footprint); CUDA_ERR;
-
+  
+  // Reorganize weights
   process_input_weights(this->packed_input_weights, this->host_weights, this->input_size, this->hidden_size);
   process_hidden_weights(this->packed_hidden_weights, this->host_weights, this->hidden_size);
   process_biases(this->packed_biases, this->host_weights, this->hidden_size);
-
+  
+  // Transfer weights
   cudaMemcpy(this->packed_input_weights_gpu, this->packed_input_weights, input_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_hidden_weights_gpu, this->packed_hidden_weights, hidden_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_biases_gpu, this->packed_biases, bias_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
@@ -549,6 +577,7 @@ uint32_t GRULayerDouble<T>::initialize() {
 
 }
 
+// Frees allocated memory
 template <typename T>
 void GRUModelDouble<T>::reset() {
 
@@ -566,6 +595,7 @@ void GRUModelDouble<T>::reset() {
   cudaFree((void *) this->gpu_syncOut);
 }
 
+// Allocates model buffers and initializes most kernel parameters
 template <typename T>
 uint32_t GRUModelDouble<T>::initialize() {
   
@@ -622,6 +652,7 @@ uint32_t GRUModelDouble<T>::initialize() {
 
 }
 
+// Set tiling parameters (should be encapsulated elsewhere)
 template <typename T>
 void GRUModelDouble<T>::set_configuration(int x, int y, int g, int t) {
   this->tile_width = x;
@@ -630,32 +661,33 @@ void GRUModelDouble<T>::set_configuration(int x, int y, int g, int t) {
   this->group_threads = t;
 }
 
-
-
+// Process input sequence (both time dependent and independent
 template <typename T>
 float GRUModelDouble<T>::run_input(T* input, uint32_t * length) {
- 
+  
+  // Initialize remaining kernel parameters
   this->mm_m = this->batch_size * *length;
   this->paramsMM[3] = (void *) &(this->mm_m);
   this->paramsGRU[8] = (void *) length;
  
+  // GEMM Kernel Dimensioning
   dim3 mm_grid = dim3((this->mm_n + MM_TILE_SIZE - 1) / MM_TILE_SIZE, (this->mm_m + MM_TILE_SIZE - 1) / MM_TILE_SIZE);
   dim3 mm_block = dim3(MM_BLOCK_SIZE, MM_BLOCK_SIZE);
-
   size_t mm_sm_requirement = MM_TILE_SIZE * MM_TILE_SIZE * 2 * sizeof(float);
   
+  // GRU Double Kernel Dimensioning
   int effective_w = (this->num_groups * this->tile_width) / (GRU_GATES - 1);
   dim3 gru_rnn_grid = dim3((this->output_size + effective_w - 1) / effective_w, (this->batch_size + this->tile_height - 1) / this->tile_height);
   dim3 gru_rnn_block = dim3(this->num_groups * this->group_threads);
-  
   unsigned block_size = gru_rnn_block.x;
   unsigned grid_size = gru_rnn_grid.x * gru_rnn_grid.y;
   
+  // Kernel instantiation (currently only configured for manual tuning)
   void * kernel = (void *)gru_rnn<1024, 4, 5, 8, 32, 5>;
 
+  // Check occupancy before running to prevent program hangs
   int numBlocks = 0;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, block_size, 0);
-
   if (grid_size > 80 * numBlocks) {
     printf("grid_size: %3d numBlocks: %3d block_size: %3d\n", grid_size, numBlocks * 80, block_size);
     return -std::numeric_limits<float>::infinity();
@@ -664,12 +696,15 @@ float GRUModelDouble<T>::run_input(T* input, uint32_t * length) {
   cudaEvent_t start, end;
   float elapsed;
   
+  // Send inputs
   cudaMemcpy(this->gpu_inputs, input, this->initial_input_size * this->batch_size * *length * sizeof(T), cudaMemcpyHostToDevice);
-  cudaMemset(this->gpu_output, 0, this->output_size * this->batch_size * sizeof(T)); 
+  
+  // Timing
   cudaEventCreate(&start);
   cudaEventCreate(&end);
   cudaEventRecord(start);
   
+  // Kernel launches
   cudaLaunchKernel((void *)matmul, mm_grid, mm_block, this->paramsMM, mm_sm_requirement);
   cudaLaunchKernel(kernel, gru_rnn_grid, gru_rnn_block, this->paramsGRU);
   
@@ -680,6 +715,7 @@ float GRUModelDouble<T>::run_input(T* input, uint32_t * length) {
   cudaMemcpy(this->host_output, this->gpu_output, this->output_size * this->batch_size * sizeof(T), cudaMemcpyDeviceToHost);
 
 #ifdef DEBUG
+  // Value checking
   for (int i = 0; i < this->batch_size; i++) {
     printf("Sequence %2d\n", i);
     for (int j = 0; j < this->output_size; j++) {
@@ -689,7 +725,8 @@ float GRUModelDouble<T>::run_input(T* input, uint32_t * length) {
   }
   printf("\n");
 #endif
-
+  
+  // Check for runtime errors
   cudaError_t err;
   cudaDeviceSynchronize();
   if ((err = cudaGetLastError()) != cudaSuccess) {
@@ -701,7 +738,6 @@ float GRUModelDouble<T>::run_input(T* input, uint32_t * length) {
 }
 
 // Explicit template instantiations
-
 template void process_input_weights<float>(float *, std::vector<float *>, uint32_t, uint32_t);
 template void process_hidden_weights<float>(float *, std::vector<float *>, uint32_t);
 template void process_biases<float>(float *, std::vector<float *>, uint32_t);
