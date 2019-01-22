@@ -83,7 +83,6 @@ __global__ void matmul(float * A, float * B, float * C,
     // into register arrays.
     __syncthreads();
     
-    
       
     // Loop through full tile
     for (uint32_t j  = 0; j < MM_TILE_SIZE; j++) {
@@ -124,7 +123,6 @@ __global__ void matmul(float * A, float * B, float * C,
     }
   }
 }
-
 
 template<int HIDDEN_SIZE, int TILE_WIDTH, int TILE_HEIGHT, int NUM_GROUPS, int GROUP_THREADS, int BATCH_SIZE>
 __global__ void gru_rnn(const float* precomputed_inputs,
@@ -181,7 +179,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
   thread_block bl = this_thread_block();
   thread_block_tile<GROUP_THREADS> work_group = tiled_partition<GROUP_THREADS>(bl);
   
-  // Stream appropraite weights for element_id and gate_id into the regiter file
+  // Stream appropriate weights for element_id and gate_id into the register file
   for (int i = 0; i < TILE_WIDTH; i++) {
     int group_id = bidx * OUTPUT_TILE_WIDTH + wg_id * TILE_WIDTH + i;
 
@@ -195,7 +193,8 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       }
     }
   }
-
+  
+  // Load biases and define time independent offsets
   if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
     int group_id = (bidx * OUTPUT_TILE_WIDTH + wg_id * TILE_WIDTH + work_group.thread_rank()) % TILE_WIDTH;
     int gate_id = (bidx * TILE_WIDTH * NUM_GROUPS + wg_id * TILE_WIDTH + work_group.thread_rank()) % TILE_WIDTH;
@@ -210,6 +209,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
       bias = 0.f;
     }
   }
+
   // Stream weights for the r gate into the register file
   for (int j = 0; j < OUTPUT_TILE_WIDTH; j++) {
     for (int i = 0; i < ELEMS_PER_THREAD; i++) {
@@ -385,6 +385,7 @@ __global__ void gru_rnn(const float* precomputed_inputs,
      
     
     // R gate computation finished, so gates z and h_cand now perform tiled matrix multiplication
+    // Note separate codepaths because compiler would otherwise introduce divergence
     if (g_type == 0) {
       for (int k = 0; k < LENGTH; k++) {
         for (int j = 0; j < TILE_HEIGHT; j++) {
@@ -499,6 +500,7 @@ void process_biases(T * output, std::vector<T*> weights, uint32_t hidden_size) {
 
 }
 
+// Free buffers (all tiling dimension dependent)
 template <typename T>
 void GRULayerSingle<T>::reset() {
   cudaFreeHost((void *) this->packed_input_weights);
@@ -511,7 +513,7 @@ void GRULayerSingle<T>::reset() {
   cudaFree((void *) this->packed_biases_gpu);
 }
 
-
+// Initialize and fill trained parameter buffers
 template<typename T>
 uint32_t GRULayerSingle<T>::initialize() {
   
@@ -520,7 +522,8 @@ uint32_t GRULayerSingle<T>::initialize() {
   uint32_t hidden_r_footprint = hidden_weight_r_footprint();
   uint32_t bias_footprint = bias_weight_footprint();
   uint32_t bias_r_footprint = bias_weight_r_footprint();
-
+  
+  // Allocate buffers
   cudaHostAlloc((void **) &(this->packed_input_weights), input_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_hidden_weights), hidden_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_biases), bias_footprint, cudaHostAllocDefault); CUDA_ERR;
@@ -529,11 +532,13 @@ uint32_t GRULayerSingle<T>::initialize() {
   cudaMalloc((void **) &(this->packed_biases_gpu), bias_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_hidden_weights_r_gpu), hidden_r_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_biases_r_gpu), bias_r_footprint); CUDA_ERR;
-
+  
+  // Reorganize weights
   process_input_weights(this->packed_input_weights, this->host_weights, this->input_size, this->hidden_size);
   process_hidden_weights(this->packed_hidden_weights, this->host_weights, this->hidden_size);
   process_biases(this->packed_biases, this->host_weights, this->hidden_size);
 
+  // Send to GPU
   cudaMemcpy(this->packed_input_weights_gpu, this->packed_input_weights, input_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_hidden_weights_gpu, this->packed_hidden_weights, hidden_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_biases_gpu, this->packed_biases, bias_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
@@ -544,6 +549,7 @@ uint32_t GRULayerSingle<T>::initialize() {
 
 }
 
+// Reset model parameters
 template <typename T>
 void GRUModelSingle<T>::reset() {
 
@@ -561,6 +567,7 @@ void GRUModelSingle<T>::reset() {
   cudaFree((void *) this->gpu_syncOut);
 }
 
+// Initialize model buffers
 template <typename T>
 uint32_t GRUModelSingle<T>::initialize() {
   
@@ -619,6 +626,7 @@ uint32_t GRUModelSingle<T>::initialize() {
 
 }
 
+// Define tiling configuration (should be encapsulated elsewhere)
 template <typename T>
 void GRUModelSingle<T>::set_configuration(int x, int y, int g, int t) {
   this->tile_width = x;
@@ -627,33 +635,34 @@ void GRUModelSingle<T>::set_configuration(int x, int y, int g, int t) {
   this->group_threads = t;
 }
 
-
-
+// Process input sequence batch
 template <typename T>
 float GRUModelSingle<T>::run_input(T* input, uint32_t * length) {
- 
+  
+  // Define remaining kernel parameters
   this->mm_m = this->batch_size * *length;
   this->paramsMM[3] = (void *) &(this->mm_m);
   this->paramsGRU[10] = (void *) length;
- 
+  
+  // GEMM Kernel dimensioning
   dim3 mm_grid = dim3((this->mm_n + MM_TILE_SIZE - 1) / MM_TILE_SIZE, (this->mm_m + MM_TILE_SIZE - 1) / MM_TILE_SIZE);
   dim3 mm_block = dim3(MM_BLOCK_SIZE, MM_BLOCK_SIZE);
-
   size_t mm_sm_requirement = MM_TILE_SIZE * MM_TILE_SIZE * 2 * sizeof(float);
   
+  // GRU Kernel dimensioning
   int effective_w = (this->tile_width * this->num_groups) / 2;
   dim3 gru_rnn_grid = dim3((this->output_size + effective_w - 1) / effective_w, (this->batch_size + this->tile_height - 1) / this->tile_height);
   // While there are three gates, we use just two work groups per output to satisfy the dependency
   dim3 gru_rnn_block = dim3(this->num_groups * this->group_threads);
-  
   unsigned block_size = gru_rnn_block.x;
   unsigned grid_size = gru_rnn_grid.x * gru_rnn_grid.y;
 
+  // GRU Kernel instantiation (currently only configured for manual tuning)
   void * kernel = (void *)gru_rnn<256, 3, 1, 32, 8, 10>;
-
+  
+  // Check occupancy to prevent hangs
   int numBlocks = 0;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, block_size, 0);
-  
   if (grid_size > 80 * numBlocks) {
     printf("grid_size: %3d numBlocks: %3d\n", grid_size, numBlocks);
     return -std::numeric_limits<float>::infinity();
@@ -662,12 +671,15 @@ float GRUModelSingle<T>::run_input(T* input, uint32_t * length) {
   cudaEvent_t start, end;
   float elapsed;
   
+  // Send sequence
   cudaMemcpy(this->gpu_inputs, input, this->initial_input_size * this->batch_size * *length * sizeof(T), cudaMemcpyHostToDevice);
-  cudaMemset(this->gpu_output, 0, this->output_size * this->batch_size * sizeof(T)); 
+  
+  // Timing
   cudaEventCreate(&start);
   cudaEventCreate(&end);
   cudaEventRecord(start);
   
+  // Kernel launches
   cudaLaunchKernel((void *)matmul, mm_grid, mm_block, this->paramsMM, mm_sm_requirement);
   cudaLaunchKernel(kernel, gru_rnn_grid, gru_rnn_block, this->paramsGRU);
   
@@ -678,6 +690,7 @@ float GRUModelSingle<T>::run_input(T* input, uint32_t * length) {
   cudaMemcpy(this->host_output, this->gpu_output, this->output_size * this->batch_size * sizeof(T), cudaMemcpyDeviceToHost);
 
 #ifdef DEBUG
+  // Value checking
   for (int i = 0; i < this->batch_size; i++) {
     printf("Sequence %2d\n", i);
     for (int j = 0; j < this->output_size; j++) {
@@ -687,7 +700,8 @@ float GRUModelSingle<T>::run_input(T* input, uint32_t * length) {
   }
   printf("\n");
 #endif
-
+  
+  // Runtime error checking
   cudaError_t err;
   cudaDeviceSynchronize();
   if ((err = cudaGetLastError()) != cudaSuccess) {
@@ -699,7 +713,6 @@ float GRUModelSingle<T>::run_input(T* input, uint32_t * length) {
 }
 
 // Explicit template instantiations
-
 template void process_input_weights<float>(float *, std::vector<float *>, uint32_t, uint32_t);
 template void process_hidden_weights<float>(float *, std::vector<float *>, uint32_t);
 template void process_biases<float>(float *, std::vector<float *>, uint32_t);
