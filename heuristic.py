@@ -9,14 +9,15 @@ import argparse
 import itertools
 import numpy as np
 
+# Hardware parameters
 sms = 80
-max_regs_thread = 224
-max_regs_sm = 65536
-max_threads = 1024
+max_regs_thread = 224 # Leave 32 for indexing/pointers
+max_regs_sm = 65536 
+max_threads = 1024 # Per tb
 fma_cost = 4
-l2_bus = 64
-l2_lat = 50
-l1_lat = 5
+l2_bus = 64 # Bytes / cycle
+l2_lat = 50 # Normalized against the FMA cost
+l1_lat = 5 # Normalized against the FMA cost
 warp_size = 32
 
 class ModelType(Enum):
@@ -29,7 +30,7 @@ string_model = {'LSTM' : ModelType.LSTM, 'GRU' : ModelType.GRU}
 model_string = {ModelType.LSTM : 'LSTM', ModelType.GRU : 'GRU'}
 
 class ModelConfig:
-
+  
   def __init__(self, mt, hs, bs, tw, th, nwg, rw, sy=None):
     self.model_type = mt
     self.hidden_size = hs
@@ -83,8 +84,6 @@ class ModelConfig:
       return False
     elif (model_gates[self.model_type] * self.tile_width % self.num_work_groups) is not 0:
       return False
-#   elif self.num_threads % 128 is not 0:
-#     return False
     else:
       return True
   
@@ -96,69 +95,72 @@ class ModelConfig:
     else:
       return 4.7 * (self.partition_occupancy * self.sub_tile_width / 8) * self.tile_height * sequential_length
 
+  def lstm_fitness(self):
+    sm_bandwidth = self.hidden_size * self.tile_height * 4
+    warp_occupancy = ceil(self.num_threads / 128)
+
+    self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
+    self.sync_cost = 0 
+    if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
+      if self.reduction_width <= 16:
+        self.reduction_cost = (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+      else:
+        self.reduction_cost = log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+    else: ## Throughput limited
+      if self.reduction_width <= 16:
+        self.reduction_cost = (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+      else:
+        self.reduction_cost = log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+    self.mul_cost = round(self.fma_heuristic(), 2)
+    
+    return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
+
+  def gru_fitness_two(self):
+    sm_bandwidth = self.hidden_size * self.tile_height * 4 * 2
+    warp_occupancy = ceil(self.num_threads / 128)
+
+    self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
+    self.sync_cost = l2_lat * 2 * 2 # ceil(self.num_SMs / 32) * 2
+    if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
+      if self.reduction_width <= 16:
+        self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+      else:
+        self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+    else: ## Throughput limited
+      if self.reduction_width <= 16:
+        self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+      else:
+        self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+    self.mul_cost = round(self.fma_heuristic() * 1.5, 2)
+    return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
+
+  def gru_fitness_one(self):
+    sm_bandwidth = self.hidden_size * self.tile_height * 4 + self.hidden_size * (self.hidden_size / self.tile_width) * self.tile_height * 4
+    warp_occupancy = ceil(self.num_threads / 128)
+
+    self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
+    self.sync_cost = 0
+    if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
+      if self.reduction_width <= 16:
+        self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+      else:
+        self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
+    else: ## Throughput limited
+      if self.reduction_width <= 16:
+        self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+      else:
+        self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
+    self.mul_cost = round(self.fma_heuristic() + self.tile_width + self.hidden_size / self.tile_width, 2)
+    return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
+    
   def fitness(self):
     if self.model_type is ModelType.LSTM:
-      sm_bandwidth = self.hidden_size * self.tile_height * 4
-      warp_occupancy = ceil(self.num_threads / 128)
-
-      self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
-      #print("Mem_cost:", mem_cost)
-      self.sync_cost = 0 # ceil(self.num_SMs / 32) * 2
-      #print("Sync_cost:", sync_cost)
-      if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
-        if self.reduction_width <= 16:
-          self.reduction_cost = (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-        else:
-          self.reduction_cost = log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-      else: ## Throughput limited
-        if self.reduction_width <= 16:
-          self.reduction_cost = (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-        else:
-          self.reduction_cost = log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-      #print("Red_cost:", reduction_cost)
-      self.mul_cost = round(self.fma_heuristic(), 2)
-      #print("Mul_cost:", mul_cost)
-      
-      return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
-
+      return self.lstm_fitness()
     elif self.model_type is ModelType.GRU:
       if self.sync is 2:
-        sm_bandwidth = self.hidden_size * self.tile_height * 4 * 2
-        warp_occupancy = ceil(self.num_threads / 128)
-
-        self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
-        self.sync_cost = l2_lat * 2 * 2 # ceil(self.num_SMs / 32) * 2
-        if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
-          if self.reduction_width <= 16:
-            self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-          else:
-            self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-        else: ## Throughput limited
-          if self.reduction_width <= 16:
-            self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-          else:
-            self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-        self.mul_cost = round(self.fma_heuristic() * 1.5, 2)
-        return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
-
+        return self.gru_fitness_two()
       elif self.sync is 1:
-        sm_bandwidth = self.hidden_size * self.tile_height * 4 + self.hidden_size * (self.hidden_size / self.tile_width) * self.tile_height * 4
-        warp_occupancy = ceil(self.num_threads / 128)
-
-        self.mem_cost = round(sm_bandwidth * (1 + floor(self.num_SMs / (sms / 2))) / (fma_cost * l2_bus), 2)
-        self.sync_cost = 0
-        if warp_occupancy * self.sub_tile_width * self.tile_height < 12: ## Non-throughput limited 
-          if self.reduction_width <= 16:
-            self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-          else:
-            self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** (warp_occupancy * self.sub_tile_width * self.tile_height)
-        else: ## Throughput limited
-          if self.reduction_width <= 16:
-            self.reduction_cost = 2 * (log2(self.reduction_width) + 1) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-          else:
-            self.reduction_cost = 2 * log2(self.reduction_width) * 7 * 1.03 ** 8 * (warp_occupancy * self.sub_tile_width * self.tile_height / 12)
-        self.mul_cost = round(self.fma_heuristic() + self.tile_width + self.hidden_size / self.tile_width, 2)
-        return self.mem_cost + self.sync_cost + self.reduction_cost + self.mul_cost
+        return self.gru_fitness_one()
 
   def to_csv(self):
     rep = str(self.tile_width) + ","
@@ -192,6 +194,7 @@ def main(model, input_size, hidden_size, batch_size, k):
   reduction_widths = [2 ** i for i in range(6)]
 
   configs = list()
+  # Build dictionary of configurations
   for x, y in tile_configurations:
     if batch_size % y is 0:
       num_gate_elements = x * model_gates[model]
@@ -204,15 +207,20 @@ def main(model, input_size, hidden_size, batch_size, k):
             else:
               configs.append(ModelConfig(model, hidden_size, batch_size, x, y, i, r, sy=1))
               configs.append(ModelConfig(model, hidden_size, batch_size, x, y, i, r, sy=2))
-  print(len(configs)) 
+  
+  # Prune
   configs = [x for x in configs if x.is_valid()]
-  print(len(configs))
+  # Evaluate
   configs.sort(key=lambda config: config.cost)
   
+  # Save chosen configurations
   with open("configs_" + str(hidden_size) + "_" + str(batch_size) + "_" + model_string[model] + ".csv", mode='w') as f:
-    counter = 0
-    for entry in configs:
-      f.write(entry.to_csv())
+    if k is -1:
+      for entry in configs:
+        f.write(entry.to_csv())
+    else:
+      for entry in configs[:k]:
+        f.write(entry.to_csv())
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='Use heuristic based analysis of \
@@ -226,7 +234,7 @@ if __name__ == '__main__':
                       help='Length of hidden size/output of layer')
   parser.add_argument('-b', '--batch_size', default=1, type=int, required=False,
                       help='Size of batch to be computed simultaneously')
-  parser.add_argument('-k', '--top_k', default=10, type=int, required=False,
+  parser.add_argument('-k', '--top_k', default=-1, type=int, required=False,
                       help='How many candidate configurations to return')
   args = parser.parse_args()
   main(args.model_type, args.input_size, args.hidden_size, args.batch_size, args.top_k)
