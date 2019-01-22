@@ -83,8 +83,6 @@ __global__ void matmul(float * A, float * B, float * C,
     // into register arrays.
     __syncthreads();
     
-    
-      
     // Loop through full tile
     for (uint32_t j  = 0; j < MM_TILE_SIZE; j++) {
       
@@ -115,7 +113,6 @@ __global__ void matmul(float * A, float * B, float * C,
   }
 
   __syncthreads();
-
   
   for (uint32_t j = 0; j < LOAD_STEPS; j++) {
     uint32_t index = j * NUM_THREADS + id;
@@ -123,9 +120,7 @@ __global__ void matmul(float * A, float * B, float * C,
       C[ (bidy * MM_TILE_SIZE + (index / MM_TILE_SIZE)) * N + bidx * MM_TILE_SIZE +  (index % MM_TILE_SIZE)] = bufferA[index];
     }
   }
-
 }
-
 
 // This kernel assumes the input multiplications were precomputed in a large matrix-matrix multiplication
 template<int HIDDEN_SIZE, int TILE_WIDTH, int TILE_HEIGHT, int NUM_GROUPS, int GROUP_THREADS, int BATCH_SIZE>
@@ -505,7 +500,6 @@ void process_input_weights(T * output, std::vector<T*> weights, uint32_t input_s
       }
     }
   }
-
 }
 
 template<typename T>
@@ -521,7 +515,6 @@ void process_hidden_weights(T * output, std::vector<T*> weights, uint32_t hidden
       }
     }
   }
-
 }
 
 template<typename T>
@@ -534,7 +527,6 @@ void process_biases(T * output, std::vector<T*> weights, uint32_t hidden_size) {
       output[k * GRU_GATES + i] = weights.at(i + 6)[k];
     }
   }
-
 }
 
 template <typename T>
@@ -574,7 +566,6 @@ uint32_t GRULayerDouble<T>::initialize() {
   cudaMemcpy(this->packed_biases_gpu, this->packed_biases, bias_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
 
   return 0;
-
 }
 
 // Frees allocated memory
@@ -649,7 +640,6 @@ uint32_t GRUModelDouble<T>::initialize() {
   this->paramsGRU[7] = (void*) &(this->gpu_syncOut);
 
   return 0;
-
 }
 
 // Set tiling parameters (should be encapsulated elsewhere)

@@ -82,7 +82,6 @@ __global__ void matmul(float * A, float * B, float * C,
     // Ensures all data is written from global memory to shared memory before it is streamed
     // into register arrays.
     __syncthreads();
-    
       
     // Loop through full tile
     for (uint32_t j  = 0; j < MM_TILE_SIZE; j++) {
@@ -114,7 +113,6 @@ __global__ void matmul(float * A, float * B, float * C,
   }
 
   __syncthreads();
-
   
   for (uint32_t j = 0; j < LOAD_STEPS; j++) {
     uint32_t index = j * NUM_THREADS + id;
@@ -383,7 +381,6 @@ __global__ void gru_rnn(const float* precomputed_inputs,
     
     __syncthreads();
      
-    
     // R gate computation finished, so gates z and h_cand now perform tiled matrix multiplication
     // Note separate codepaths because compiler would otherwise introduce divergence
     if (g_type == 0) {
@@ -466,7 +463,6 @@ void process_input_weights(T * output, std::vector<T*> weights, uint32_t input_s
       }
     }
   }
-
 }
 
 template<typename T>
@@ -483,7 +479,6 @@ void process_hidden_weights(T * output, std::vector<T*> weights, uint32_t hidden
       }
     }
   }
-
 }
 
 template<typename T>
@@ -497,7 +492,6 @@ void process_biases(T * output, std::vector<T*> weights, uint32_t hidden_size) {
       if (weights.at(i + 7)[k] != 0.5) err++;
     }
   }
-
 }
 
 // Free buffers (all tiling dimension dependent)
@@ -546,7 +540,6 @@ uint32_t GRULayerSingle<T>::initialize() {
   cudaMemcpy(this->packed_biases_r_gpu, this->host_weights.at(BIAS_R), bias_r_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
 
   return 0;
-
 }
 
 // Reset model parameters
@@ -623,7 +616,6 @@ uint32_t GRUModelSingle<T>::initialize() {
   this->paramsGRU[9] = (void*) &(this->gpu_syncOut);
 
   return 0;
-
 }
 
 // Define tiling configuration (should be encapsulated elsewhere)

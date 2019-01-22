@@ -22,7 +22,7 @@ __device__ __forceinline__ float sigmoidf(float x) {
 // The kernel uses a two tiered tiling mechanism that first tiles large
 // tiles from global memory to shared memory. This shared memory tile is
 // then used as the source to stream data into register arrays that perform
-// a calculation on a 8x8 tile.
+// a calculation on a 4x4 tile.
 
 __global__ void matmul(float * A, float * B, float * C,
                        uint32_t M, uint32_t K, uint32_t N) {
@@ -123,7 +123,6 @@ __global__ void matmul(float * A, float * B, float * C,
       C[ (bidy * MM_TILE_SIZE + (index / MM_TILE_SIZE)) * N + bidx * MM_TILE_SIZE +  (index % MM_TILE_SIZE)] = bufferA[index];
     }
   }
-
 }
 
 
@@ -404,7 +403,6 @@ void process_input_weights(T * output, std::vector<T*> weights, uint32_t input_s
       }
     }
   }
-
 }
 
 template<typename T>
@@ -420,7 +418,6 @@ void process_hidden_weights(T * output, std::vector<T*> weights, uint32_t hidden
       }
     }
   }
-
 }
 
 template<typename T>
@@ -433,7 +430,6 @@ void process_biases(T * output, std::vector<T*> weights, uint32_t hidden_size) {
       output[k * LSTM_GATES + i] = weights.at(i + 8)[k];
     }
   }
-
 }
 
 // Initialize all layer weights and send to GPU
@@ -529,7 +525,6 @@ uint32_t LSTMModel<T>::initialize() {
   this->paramsLSTM[6] = (void*) &(this->gpu_syncOut);
 
   return 0;
-
 }
 
 // Frees model buffers
@@ -629,7 +624,6 @@ float LSTMModel<T>::run_input(T* input, uint32_t * length) {
   }
   
   return elapsed;
-
 }
 
 // Explicit template instantiations
