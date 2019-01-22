@@ -18,7 +18,7 @@ __device__ __forceinline__ float sigmoidf(float x) {
 #define MM_REG_TILE 4
 #define MM_TILE_SIZE 64
 
-// This is a fairly heavily optimized kernel for matrix multiplication
+// This is a mostly optimized kernel for matrix multiplication
 // The kernel uses a two tiered tiling mechanism that first tiles large
 // tiles from global memory to shared memory. This shared memory tile is
 // then used as the source to stream data into register arrays that perform
