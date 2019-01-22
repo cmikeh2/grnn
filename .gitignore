@@ -1,2 +1,2 @@
-bin/*
+src/bin/*
 __pycache__
