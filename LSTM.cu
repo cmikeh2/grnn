@@ -205,6 +205,7 @@ __global__ void lstm_rnn( const float* precomputed_inputs,
     cell_state[tid / OUTPUT_TILE_WIDTH][tid % OUTPUT_TILE_WIDTH] = 0.0f;
   }
   
+  // Initialize hidden state buffer according to input / zero out rest of buffer
   for (int j = 0; j < TILE_HEIGHT; j++) {
     for (int i = 0; i < BUFFER_SIZE; i += NUM_GROUPS * GROUP_THREADS) {
       if (i + tid < HIDDEN_SIZE) {
@@ -215,7 +216,8 @@ __global__ void lstm_rnn( const float* precomputed_inputs,
     }
   }
   __syncthreads();
-
+  
+  // Zero dot product accumulators
   #pragma unroll
   for (int j = 0; j < TILE_HEIGHT; j++) {
     #pragma unroll
@@ -263,6 +265,7 @@ __global__ void lstm_rnn( const float* precomputed_inputs,
       }
     }
     
+    // Remap work and compute activations
     if (work_group.thread_rank() < TILE_WIDTH * TILE_HEIGHT) {
       int reg_y = work_group.thread_rank() / TILE_WIDTH;
       int reg_x = work_group.thread_rank() % TILE_WIDTH;
@@ -310,9 +313,19 @@ __global__ void lstm_rnn( const float* precomputed_inputs,
       // Broadcast output to global memory
       output[sequence_iteration * HIDDEN_SIZE * BATCH_SIZE + (bidy * TILE_HEIGHT + y) * HIDDEN_SIZE + bidx * OUTPUT_TILE_WIDTH + x] = out_reg;
     }
-
+    
+    // Escape recurrent loop when full sequence has been processed
     if (sequence_iteration + 1 == length) break;
+    
 
+    
+    // Synchronize between recurrent iterations - signal stage
+    if (tid == 0 ) {
+      syncIn[(bidy * gridDim.x + bidx)] = sequence_iteration + 1;
+    }
+    __threadfence();
+    
+    // Zero the dot product accumulators
     #pragma unroll
     for (int j = 0; j < TILE_HEIGHT; j++) {
       #pragma unroll
@@ -334,13 +347,8 @@ __global__ void lstm_rnn( const float* precomputed_inputs,
                                       (sequence_iteration + 1) * BATCH_SIZE * HIDDEN_SIZE * LSTM_GATES];
 
     }
-
     
-    // Synchronize between recurrent iterations
-    if (tid == 0 ) {
-      syncIn[(bidy * gridDim.x + bidx)] = sequence_iteration + 1;
-    }
-    __threadfence();
+    // Synchronize between recurrent iterations - spin stage
     if (bidx == 0) {
       if (tid < gridDim.x) {
         while (syncIn[(bidy * gridDim.x + tid)]  != sequence_iteration + 1) {
@@ -428,24 +436,28 @@ void process_biases(T * output, std::vector<T*> weights, uint32_t hidden_size) {
 
 }
 
+// Initialize all layer weights and send to GPU
 template<typename T>
 uint32_t LSTMLayer<T>::initialize() {
   
   uint32_t input_footprint = input_weight_footprint();
   uint32_t hidden_footprint = hidden_weight_footprint();
   uint32_t bias_footprint = bias_weight_footprint();
-
+  
+  // Weight buffer allocations
   cudaHostAlloc((void **) &(this->packed_input_weights), input_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_hidden_weights), hidden_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaHostAlloc((void **) &(this->packed_biases), bias_footprint, cudaHostAllocDefault); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_input_weights_gpu), input_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_hidden_weights_gpu), hidden_footprint); CUDA_ERR;
   cudaMalloc((void **) &(this->packed_biases_gpu), bias_footprint); CUDA_ERR;
-
+  
+  // Reorganize weights (typically a transpose)
   process_input_weights(this->packed_input_weights, this->host_weights, this->input_size, this->hidden_size);
   process_hidden_weights(this->packed_hidden_weights, this->host_weights, this->hidden_size);
   process_biases(this->packed_biases, this->host_weights, this->hidden_size);
-
+  
+  // Send weights to GPU
   cudaMemcpy(this->packed_input_weights_gpu, this->packed_input_weights, input_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_hidden_weights_gpu, this->packed_hidden_weights, hidden_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
   cudaMemcpy(this->packed_biases_gpu, this->packed_biases, bias_footprint, cudaMemcpyHostToDevice); CUDA_ERR;
@@ -454,6 +466,7 @@ uint32_t LSTMLayer<T>::initialize() {
 
 }
 
+// Free all allocated buffers. Only needed for full sweep benchmarking.
 template <typename T>
 void LSTMLayer<T>::reset() {
   cudaFreeHost((void *) this->packed_input_weights);
@@ -464,6 +477,8 @@ void LSTMLayer<T>::reset() {
   cudaFree((void *) this->packed_biases_gpu);
 }
 
+// Allocate input/output buffers for the layer. Currently set up for only single layer models, but can be extended to multi-layer 
+// without dramatic refactoring
 template <typename T>
 uint32_t LSTMModel<T>::initialize() {
   
@@ -517,6 +532,7 @@ uint32_t LSTMModel<T>::initialize() {
 
 }
 
+// Frees model buffers
 template <typename T>
 void LSTMModel<T>::reset() {
 
@@ -531,6 +547,7 @@ void LSTMModel<T>::reset() {
   cudaFree((void *) this->gpu_precompute);
 }
 
+// Defines tiling configuration (should be encapsulated elsewhere in the future)
 template <typename T>
 void LSTMModel<T>::set_configuration(int x, int y, int g, int t) {
   this->tile_width = x;
@@ -539,30 +556,33 @@ void LSTMModel<T>::set_configuration(int x, int y, int g, int t) {
   this->group_threads = t;
 }
 
+// Processes input sequence (both independent and dependent)
 template <typename T>
 float LSTMModel<T>::run_input(T* input, uint32_t * length) {
- 
+  
+  // Define remaining kernel parameters (primarily dependent on sequence length)
   this->mm_m = this->batch_size * *length;
   this->paramsMM[3] = (void *) &(this->mm_m);
   this->paramsLSTM[7] = (void *) length;
- 
+  
+  // GEMM Kernel dimensioning
   dim3 mm_grid = dim3((this->mm_n + MM_TILE_SIZE - 1) / MM_TILE_SIZE, (this->mm_m + MM_TILE_SIZE - 1) / MM_TILE_SIZE);
   dim3 mm_block = dim3(MM_BLOCK_SIZE, MM_BLOCK_SIZE);
-
   size_t mm_sm_requirement = MM_TILE_SIZE * MM_TILE_SIZE * 2 * sizeof(float);
   
+  // LSTM Kernel dimensioning
   int effective_w = (this->num_groups * this->tile_width) / LSTM_GATES;
   dim3 lstm_rnn_grid = dim3((this->output_size + effective_w - 1) / effective_w, (this->batch_size + this->tile_height - 1) / this->tile_height);
-  dim3 lstm_rnn_block = dim3(this->num_groups * this->group_threads);
-  
+  dim3 lstm_rnn_block = dim3(this->num_groups * this->group_threads);  
   unsigned block_size = lstm_rnn_block.x;
   unsigned grid_size = lstm_rnn_grid.x * lstm_rnn_grid.y;
 
+  // Kernel instantiation (currently configured for manual application of parameters)
   void * kernel = (void*)lstm_rnn<256, 2, 4, 64, 8, 40>;
-
   int numBlocks = 0;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, block_size, 0);
    
+  // Check occupancy prior to launch to prevent program hangs
   if (numBlocks == 0 || grid_size > 80) {
     printf("numBlocks: %2d grid_size: %3d, block_size: %3d\n", numBlocks, grid_size, block_size);
     return -std::numeric_limits<float>::infinity();
@@ -573,10 +593,12 @@ float LSTMModel<T>::run_input(T* input, uint32_t * length) {
   
   cudaMemcpy(this->gpu_inputs, input, this->initial_input_size * this->batch_size * *length * sizeof(T), cudaMemcpyHostToDevice);
   
+  // Timing info
   cudaEventCreate(&start);
   cudaEventCreate(&end);
   cudaEventRecord(start);
   
+  // Kernel launches
   cudaLaunchKernel((void *)matmul, mm_grid, mm_block, this->paramsMM, mm_sm_requirement);
   cudaLaunchKernel(kernel, lstm_rnn_grid, lstm_rnn_block, this->paramsLSTM);
   
@@ -586,15 +608,19 @@ float LSTMModel<T>::run_input(T* input, uint32_t * length) {
    
   cudaMemcpy(this->host_output, this->gpu_output, this->output_size * this->batch_size * sizeof(T), cudaMemcpyDeviceToHost); 
   
-//for (int i = 0; i < this->batch_size; i++) {
-//  printf("Sequence %2d\n", i);
-//  for (int j = 0; j < this->output_size; j++) {
-//    printf("%f ", this->host_output[i * this->output_size + j]);
-//  }
-//  printf("\n");
-//}
-//printf("\n");
-
+#ifdef DEBUG
+  // Value checking
+  for (int i = 0; i < this->batch_size; i++) {
+    printf("Sequence %2d\n", i);
+    for (int j = 0; j < this->output_size; j++) {
+      printf("%f ", this->host_output[i * this->output_size + j]);
+    }
+    printf("\n");
+  }
+  printf("\n");
+#endif
+  
+  // Check for runtime errors
   cudaError_t err;
   cudaDeviceSynchronize();
   if ((err = cudaGetLastError()) != cudaSuccess) {
@@ -604,11 +630,9 @@ float LSTMModel<T>::run_input(T* input, uint32_t * length) {
   
   return elapsed;
 
-
 }
 
 // Explicit template instantiations
-
 template void process_input_weights<float>(float *, std::vector<float *>, uint32_t, uint32_t);
 template void process_hidden_weights<float>(float *, std::vector<float *>, uint32_t);
 template void process_biases<float>(float *, std::vector<float *>, uint32_t);

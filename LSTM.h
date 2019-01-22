@@ -54,6 +54,7 @@ template<typename T>
 class LSTMModel : public RNNBase<LSTMLayer, T> {
 
   private:
+    // Kernel launch parameters
     void* paramsLSTM[8];
     
   public:
